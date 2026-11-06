@@ -545,67 +545,50 @@ fn review_action_parse_line(
     line: &[u8],
     state: &[u8],
 ) -> (Vec<u8>, Vec<AgentEvent>) {
-    let (mut counter, mut pending_severity, mut pending_message) = read_state(state);
+    let mut parser_state = read_state(state);
     let Ok(line_str) = core::str::from_utf8(line) else {
-        return (
-            encode_state(counter, pending_severity, &pending_message),
-            Vec::new(),
-        );
+        return (encode_state(&parser_state), Vec::new());
     };
     let line_str = strip_ansi(line_str);
     let trimmed = line_str.trim();
-    if trimmed.is_empty() {
-        return (
-            encode_state(counter, pending_severity, &pending_message),
-            Vec::new(),
-        );
-    }
 
     let mut events = Vec::new();
 
+    if trimmed.is_empty() {
+        parser_state.flush_diagnostic(&mut events);
+        return (encode_state(&parser_state), events);
+    }
+
     if action_id == "gleam-build" || action_id == "gleam-test" {
         if trimmed.starts_with("error: ") || trimmed.starts_with("warning: ") {
-            pending_severity = if trimmed.starts_with("error: ") { 1 } else { 2 };
-            pending_message = trimmed.to_string();
-            return (
-                encode_state(counter, pending_severity, &pending_message),
-                events,
-            );
+            parser_state.flush_diagnostic(&mut events);
+            parser_state.severity = if trimmed.starts_with("error: ") { 1 } else { 2 };
+            parser_state.title = trimmed.to_string();
+            parser_state.has_location = false;
+            parser_state.path.clear();
+            parser_state.line = 0;
+            parser_state.col = 0;
+            parser_state.explanation.clear();
+            return (encode_state(&parser_state), events);
         }
 
         if trimmed.starts_with('┌') {
             if let Some((_, location)) = trimmed.split_once('─') {
                 let location = location.trim();
                 if let Some((path, line_no, col)) = split_location(location) {
-                    let message = if pending_message.is_empty() {
-                        location.to_string()
-                    } else {
-                        pending_message.clone()
-                    };
-                    events.push(AgentEvent::NewEntry {
-                        vendor_id: format!("gleam-{counter}"),
-                        tool: "gleam".into(),
-                        category: if pending_severity == 2 {
-                            "diagnostic".into()
-                        } else {
-                            "build".into()
-                        },
-                        raw_cmd: diagnostic_json(
-                            &path,
-                            line_no,
-                            col,
-                            if pending_severity == 2 {
-                                "warning"
-                            } else {
-                                "error"
-                            },
-                            &message,
-                        ),
-                        file_paths: Vec::new(),
-                    });
-                    counter += 1;
-                    pending_severity = 0;
-                    pending_message.clear();
+                    if parser_state.has_location {
+                        parser_state.flush_diagnostic(&mut events);
+                    }
+                    if parser_state.severity == 0 {
+                        parser_state.severity = 1;
+                        parser_state.title = location.to_string();
+                    }
+                    parser_state.has_location = true;
+                    parser_state.path = path;
+                    parser_state.line = line_no;
+                    parser_state.col = col;
+                    parser_state.explanation.clear();
+                    return (encode_state(&parser_state), events);
                 }
             }
         }
@@ -613,39 +596,66 @@ fn review_action_parse_line(
 
     if action_id == "gleam-test" {
         if let Some((passed, failures)) = parse_gleeunit_summary(trimmed) {
+            parser_state.flush_diagnostic(&mut events);
             events.push(AgentEvent::CloseEntry {
-                vendor_id: format!("gleam-test-{counter}"),
+                vendor_id: format!("gleam-test-{}", parser_state.counter),
                 exit_code: if failures > 0 { 1 } else { 0 },
                 output_lines: vec![format!("{passed} passed, {failures} failures")],
             });
-            counter += 1;
+            parser_state.counter += 1;
+            return (encode_state(&parser_state), events);
         } else if let Some(rest) = trimmed.strip_prefix("Running ") {
+            parser_state.flush_diagnostic(&mut events);
             events.push(AgentEvent::NewEntry {
-                vendor_id: format!("gleam-{counter}"),
+                vendor_id: format!("gleam-{}", parser_state.counter),
                 tool: "gleam test".into(),
                 category: "test".into(),
                 raw_cmd: format!("Running {rest}"),
                 file_paths: Vec::new(),
             });
-            counter += 1;
+            parser_state.counter += 1;
+            return (encode_state(&parser_state), events);
         }
     }
 
     if action_id == "gleam-format-check" && trimmed.starts_with("- ") {
+        parser_state.flush_diagnostic(&mut events);
         events.push(AgentEvent::NewEntry {
-            vendor_id: format!("gleam-{counter}"),
+            vendor_id: format!("gleam-{}", parser_state.counter),
             tool: "gleam format".into(),
             category: "format".into(),
             raw_cmd: trimmed.to_string(),
             file_paths: vec![trimmed[2..].trim().replace('\\', "/")],
         });
-        counter += 1;
+        parser_state.counter += 1;
+        return (encode_state(&parser_state), events);
     }
 
-    (
-        encode_state(counter, pending_severity, &pending_message),
-        events,
-    )
+    if (action_id == "gleam-build" || action_id == "gleam-test") && parser_state.has_location {
+        if let Some(annotation) = extract_frame_annotation(trimmed) {
+            if parser_state.explanation.is_empty() {
+                parser_state.explanation = annotation;
+            } else {
+                parser_state.explanation.push('\n');
+                parser_state.explanation.push_str(&annotation);
+            }
+            return (encode_state(&parser_state), events);
+        }
+
+        if is_frame_line(trimmed) {
+            return (encode_state(&parser_state), events);
+        }
+
+        if parser_state.explanation.is_empty() {
+            parser_state.explanation = trimmed.to_string();
+        } else {
+            parser_state.explanation.push('\n');
+            parser_state.explanation.push_str(trimmed);
+        }
+        return (encode_state(&parser_state), events);
+    }
+
+    (encode_state(&parser_state), events)
 }
 
 /// `DiagnosticItem` JSON understood by `basalt_core::build_runner`.
@@ -660,29 +670,198 @@ fn diagnostic_json(file: &str, line: u32, col: u32, severity: &str, message: &st
     )
 }
 
-/// Parser state: counter + pending severity (`0` none, `1` error, `2` warning)
-/// + pending diagnostic message (waiting for its `┌─ path:line:col` line).
-fn read_state(state: &[u8]) -> (u32, u8, String) {
-    if state.len() < 7 {
-        return (0, 0, String::new());
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+struct ParserState {
+    counter: u32,
+    severity: u8,
+    has_location: bool,
+    line: u32,
+    col: u32,
+    title: String,
+    path: String,
+    explanation: String,
+}
+
+impl ParserState {
+    fn flush_diagnostic(&mut self, events: &mut Vec<AgentEvent>) {
+        if self.has_location && self.severity > 0 {
+            let message = if self.explanation.is_empty() {
+                self.title.clone()
+            } else if self.title.is_empty() {
+                self.explanation.clone()
+            } else {
+                format!("{}\n{}", self.title, self.explanation)
+            };
+
+            events.push(AgentEvent::NewEntry {
+                vendor_id: format!("gleam-{}", self.counter),
+                tool: "gleam".into(),
+                category: if self.severity == 2 {
+                    "diagnostic".into()
+                } else {
+                    "build".into()
+                },
+                raw_cmd: diagnostic_json(
+                    &self.path,
+                    self.line,
+                    self.col,
+                    if self.severity == 2 {
+                        "warning"
+                    } else {
+                        "error"
+                    },
+                    &message,
+                ),
+                file_paths: Vec::new(),
+            });
+            self.counter += 1;
+            self.severity = 0;
+            self.has_location = false;
+            self.title.clear();
+            self.path.clear();
+            self.line = 0;
+            self.col = 0;
+            self.explanation.clear();
+        }
+    }
+}
+
+fn read_state(state: &[u8]) -> ParserState {
+    if state.len() < 16 {
+        return ParserState::default();
     }
     let counter = u32::from_le_bytes([state[0], state[1], state[2], state[3]]);
     let severity = state[4];
-    let len = u16::from_le_bytes([state[5], state[6]]) as usize;
-    let end = (7 + len).min(state.len());
-    let message = String::from_utf8_lossy(&state[7..end]).into_owned();
-    (counter, severity, message)
+    let has_location = state[5] != 0;
+    let line = u32::from_le_bytes([state[6], state[7], state[8], state[9]]);
+    let col = u32::from_le_bytes([state[10], state[11], state[12], state[13]]);
+    let title_len = u16::from_le_bytes([state[14], state[15]]) as usize;
+
+    let mut offset = 16;
+    let title_end = (offset + title_len).min(state.len());
+    let title = String::from_utf8_lossy(&state[offset..title_end]).into_owned();
+    offset = title_end;
+
+    if offset + 2 > state.len() {
+        return ParserState {
+            counter,
+            severity,
+            has_location,
+            line,
+            col,
+            title,
+            path: String::new(),
+            explanation: String::new(),
+        };
+    }
+
+    let path_len = u16::from_le_bytes([state[offset], state[offset + 1]]) as usize;
+    offset += 2;
+    let path_end = (offset + path_len).min(state.len());
+    let path = String::from_utf8_lossy(&state[offset..path_end]).into_owned();
+    offset = path_end;
+
+    if offset + 4 > state.len() {
+        return ParserState {
+            counter,
+            severity,
+            has_location,
+            line,
+            col,
+            title,
+            path,
+            explanation: String::new(),
+        };
+    }
+
+    let expl_len = u32::from_le_bytes([
+        state[offset],
+        state[offset + 1],
+        state[offset + 2],
+        state[offset + 3],
+    ]) as usize;
+    offset += 4;
+    let expl_end = (offset + expl_len).min(state.len());
+    let explanation = String::from_utf8_lossy(&state[offset..expl_end]).into_owned();
+
+    ParserState {
+        counter,
+        severity,
+        has_location,
+        line,
+        col,
+        title,
+        path,
+        explanation,
+    }
 }
 
-fn encode_state(counter: u32, severity: u8, message: &str) -> Vec<u8> {
-    let bytes = message.as_bytes();
-    let len = bytes.len().min(u16::MAX as usize) as u16;
-    let mut out = Vec::with_capacity(7 + len as usize);
-    out.extend_from_slice(&counter.to_le_bytes());
-    out.push(severity);
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(&bytes[..len as usize]);
+fn encode_state(state: &ParserState) -> Vec<u8> {
+    let title_bytes = state.title.as_bytes();
+    let title_len = title_bytes.len().min(u16::MAX as usize) as u16;
+
+    let path_bytes = state.path.as_bytes();
+    let path_len = path_bytes.len().min(u16::MAX as usize) as u16;
+
+    let expl_bytes = state.explanation.as_bytes();
+    let expl_len = expl_bytes.len().min(u32::MAX as usize) as u32;
+
+    let mut out = Vec::with_capacity(
+        16 + 2 + title_len as usize + 2 + path_len as usize + 4 + expl_len as usize,
+    );
+    out.extend_from_slice(&state.counter.to_le_bytes());
+    out.push(state.severity);
+    out.push(if state.has_location { 1 } else { 0 });
+    out.extend_from_slice(&state.line.to_le_bytes());
+    out.extend_from_slice(&state.col.to_le_bytes());
+    out.extend_from_slice(&title_len.to_le_bytes());
+    out.extend_from_slice(&title_bytes[..title_len as usize]);
+    out.extend_from_slice(&path_len.to_le_bytes());
+    out.extend_from_slice(&path_bytes[..path_len as usize]);
+    out.extend_from_slice(&expl_len.to_le_bytes());
+    out.extend_from_slice(&expl_bytes[..expl_len as usize]);
     out
+}
+
+fn is_frame_line(trimmed: &str) -> bool {
+    if trimmed.contains('│') {
+        return true;
+    }
+    if trimmed == "|" || trimmed.starts_with('|') {
+        return true;
+    }
+    if let Some((prefix, _)) = trimmed.split_once('|') {
+        let prefix = prefix.trim();
+        if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    if trimmed.chars().all(|c| c == '^' || c == ' ' || c == '-') && trimmed.contains('^') {
+        return true;
+    }
+    false
+}
+
+fn extract_frame_annotation(trimmed: &str) -> Option<String> {
+    let after_bar = if let Some((_, after)) = trimmed.split_once('│') {
+        after
+    } else if let Some((prefix, after)) = trimmed.split_once('|') {
+        if prefix.trim().is_empty() || prefix.trim().chars().all(|c| c.is_ascii_digit()) {
+            after
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    if after_bar.contains('^') {
+        let text = after_bar.trim_start_matches(|c| c == ' ' || c == '^').trim();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    None
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -944,20 +1123,23 @@ gleeunit = ">= 1.0.0 and < 2.0.0"
 
     #[test]
     fn build_errors_emit_diagnostic_events() {
-        // The header stores the pending message; the location line emits one
-        // JSON DiagnosticItem with the exact file/line/col.
+        // The header stores pending severity and title; the location line sets the location;
+        // an empty separator line flushes the complete diagnostic entry.
         let (state, header_events) =
             review_action_parse_line("gleam-build", b"error: Unknown variable", &[]);
         assert!(header_events.is_empty());
-        assert_eq!(read_state(&state).1, 1);
+        assert_eq!(read_state(&state).severity, 1);
 
-        let (_, location_events) = review_action_parse_line(
+        let (state, location_events) = review_action_parse_line(
             "gleam-build",
             b"  \xe2\x94\x8c\xe2\x94\x80 C:\\ws\\src\\main.gleam:2:7",
             &state,
         );
+        assert!(location_events.is_empty());
+
+        let (_, flush_events) = review_action_parse_line("gleam-build", b"", &state);
         assert!(matches!(
-            &location_events[0],
+            &flush_events[0],
             AgentEvent::NewEntry { category, raw_cmd, file_paths, .. }
                 if category == "build"
                     && raw_cmd.contains("\"line\":2")
@@ -965,6 +1147,211 @@ gleeunit = ">= 1.0.0 and < 2.0.0"
                     && raw_cmd.contains("Unknown variable")
                     && file_paths.is_empty()
         ));
+    }
+
+    #[test]
+    fn multiline_error_preserves_arity_explanation() {
+        let lines = [
+            "error: Incorrect arity",
+            "  ┌─ test/add_helper_test.gleam:2213:5",
+            "  │",
+            "  The constructor expects 8 arguments, but was given 7.",
+            "  Missing argument: audio_path",
+            "",
+        ];
+        let mut state = Vec::new();
+        let mut events = Vec::new();
+        for line in lines {
+            let (s, ev) = review_action_parse_line("gleam-build", line.as_bytes(), &state);
+            state = s;
+            events.extend(ev);
+        }
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::NewEntry { category, raw_cmd, file_paths, .. } => {
+                assert_eq!(category, "build");
+                assert!(file_paths.is_empty());
+                assert!(raw_cmd.contains("\"file\":\"test/add_helper_test.gleam\""));
+                assert!(raw_cmd.contains("\"line\":2213"));
+                assert!(raw_cmd.contains("\"col\":5"));
+                assert!(raw_cmd.contains("\"severity\":\"error\""));
+                assert!(raw_cmd.contains("error: Incorrect arity"));
+                assert!(raw_cmd.contains("The constructor expects 8 arguments, but was given 7."));
+                assert!(raw_cmd.contains("Missing argument: audio_path"));
+            }
+            _ => panic!("Expected NewEntry event"),
+        }
+    }
+
+    #[test]
+    fn multiline_error_preserves_unknown_labels_explanation() {
+        let lines = [
+            "error: Unknown labels",
+            "  ┌─ test/add_helper_test.gleam:2191:7",
+            "  │",
+            "  The label `audio_url` is not recognized. Did you mean `audio_path`?",
+            "",
+        ];
+        let mut state = Vec::new();
+        let mut events = Vec::new();
+        for line in lines {
+            let (s, ev) = review_action_parse_line("gleam-build", line.as_bytes(), &state);
+            state = s;
+            events.extend(ev);
+        }
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::NewEntry { category, raw_cmd, .. } => {
+                assert_eq!(category, "build");
+                assert!(raw_cmd.contains("\"file\":\"test/add_helper_test.gleam\""));
+                assert!(raw_cmd.contains("\"line\":2191"));
+                assert!(raw_cmd.contains("\"col\":7"));
+                assert!(raw_cmd.contains("\"severity\":\"error\""));
+                assert!(raw_cmd.contains("error: Unknown labels"));
+                assert!(raw_cmd.contains("The label `audio_url` is not recognized. Did you mean `audio_path`?"));
+                assert!(raw_cmd.contains("Did you mean `audio_path`?"));
+            }
+            _ => panic!("Expected NewEntry event"),
+        }
+    }
+
+    #[test]
+    fn consecutive_errors_flush_on_next_header() {
+        let lines = [
+            "error: Incorrect arity",
+            "  ┌─ test/add_helper_test.gleam:2213:5",
+            "  │",
+            "  The constructor expects 8 arguments, but was given 7.",
+            "  Missing argument: audio_path",
+            "error: Unknown labels",
+            "  ┌─ test/add_helper_test.gleam:2191:7",
+            "  │",
+            "  The label `audio_url` is not recognized. Did you mean `audio_path`?",
+            "",
+        ];
+        let mut state = Vec::new();
+        let mut events = Vec::new();
+        for line in lines {
+            let (s, ev) = review_action_parse_line("gleam-build", line.as_bytes(), &state);
+            state = s;
+            events.extend(ev);
+        }
+
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            AgentEvent::NewEntry { raw_cmd, .. } => {
+                assert!(raw_cmd.contains("\"line\":2213"));
+                assert!(raw_cmd.contains("Missing argument: audio_path"));
+            }
+            _ => panic!("Expected NewEntry for first error"),
+        }
+        match &events[1] {
+            AgentEvent::NewEntry { raw_cmd, .. } => {
+                assert!(raw_cmd.contains("\"line\":2191"));
+                assert!(raw_cmd.contains("Did you mean `audio_path`?"));
+            }
+            _ => panic!("Expected NewEntry for second error"),
+        }
+    }
+
+    #[test]
+    fn multiline_error_flushed_by_gleeunit_summary() {
+        let lines = [
+            "error: Incorrect arity",
+            "  ┌─ test/add_helper_test.gleam:2213:5",
+            "  │",
+            "  The constructor expects 8 arguments, but was given 7.",
+            "  Missing argument: audio_path",
+            "0 passed, 1 failures",
+        ];
+        let mut state = Vec::new();
+        let mut events = Vec::new();
+        for line in lines {
+            let (s, ev) = review_action_parse_line("gleam-test", line.as_bytes(), &state);
+            state = s;
+            events.extend(ev);
+        }
+
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            AgentEvent::NewEntry { raw_cmd, .. } => {
+                assert!(raw_cmd.contains("\"line\":2213"));
+                assert!(raw_cmd.contains("Missing argument: audio_path"));
+            }
+            _ => panic!("Expected NewEntry for error"),
+        }
+        match &events[1] {
+            AgentEvent::CloseEntry { exit_code, output_lines, .. } => {
+                assert_eq!(*exit_code, 1);
+                assert_eq!(output_lines[0], "0 passed, 1 failures");
+            }
+            _ => panic!("Expected CloseEntry for gleeunit summary"),
+        }
+    }
+
+    #[test]
+    fn multiline_error_with_code_snippet() {
+        let lines = [
+            "error: Type mismatch",
+            "  ┌─ src/main.gleam:10:3",
+            "  │",
+            "10 │   let x: Int = \"hello\"",
+            "   │                ^^^^^^^",
+            "  │",
+            "  Expected: Int",
+            "  Found: String",
+            "",
+        ];
+        let mut state = Vec::new();
+        let mut events = Vec::new();
+        for line in lines {
+            let (s, ev) = review_action_parse_line("gleam-build", line.as_bytes(), &state);
+            state = s;
+            events.extend(ev);
+        }
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::NewEntry { raw_cmd, .. } => {
+                assert!(raw_cmd.contains("\"line\":10"));
+                assert!(raw_cmd.contains("\"col\":3"));
+                assert!(raw_cmd.contains("Type mismatch"));
+                assert!(raw_cmd.contains("Expected: Int"));
+                assert!(raw_cmd.contains("Found: String"));
+                assert!(!raw_cmd.contains("let x: Int"));
+            }
+            _ => panic!("Expected NewEntry"),
+        }
+    }
+
+    #[test]
+    fn warning_preserves_explanation_and_diagnostic_category() {
+        let lines = [
+            "warning: Unused variable",
+            "  ┌─ src/main.gleam:5:7",
+            "  │",
+            "  This variable is never used.",
+            "",
+        ];
+        let mut state = Vec::new();
+        let mut events = Vec::new();
+        for line in lines {
+            let (s, ev) = review_action_parse_line("gleam-build", line.as_bytes(), &state);
+            state = s;
+            events.extend(ev);
+        }
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::NewEntry { category, raw_cmd, .. } => {
+                assert_eq!(category, "diagnostic");
+                assert!(raw_cmd.contains("\"severity\":\"warning\""));
+                assert!(raw_cmd.contains("This variable is never used."));
+            }
+            _ => panic!("Expected NewEntry"),
+        }
     }
 
     #[test]
